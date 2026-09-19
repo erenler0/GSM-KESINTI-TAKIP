@@ -55,19 +55,25 @@ if st.button("📏 Görüntülenen Sahalar için Mesafe/Süre Hesapla (OSRM)"):
     st.success(f"{len(result_df)} saha için mesafe/süre hesaplandı ve cache'e kaydedildi.")
 
 # ---------------------------------------------------------------------------
-# Harita
+# Harita (Plotly 5.x ve 6.x Uyumlu Yapı)
 # ---------------------------------------------------------------------------
 st.subheader("🗺️ Harita — Mavi: GSM Sahaları | Kırmızı: İlçe Merkezleri")
 
+# Plotly sürüm farklarına karşı dinamik sınıf ve layout ayarı
+IS_MAPBOX = hasattr(go, "Scattermapbox")
+ScatterClass = go.Scattermapbox if IS_MAPBOX else go.Scattermap
+
 fig = go.Figure()
-fig.add_trace(go.Scattermapbox(
+
+fig.add_trace(ScatterClass(
     lon=df_f["longitude"], lat=df_f["latitude"], mode="markers",
     marker=dict(size=8, color="rgb(41,128,185)"),
     name="GSM Sahaları",
     hovertext=df_f.apply(lambda r: f"{r['placemark_adi']}<br>{r.get('il','-')} / {r.get('ilce','-')}", axis=1),
     hoverinfo="text",
 ))
-fig.add_trace(go.Scattermapbox(
+
+fig.add_trace(ScatterClass(
     lon=merkezler["longitude"], lat=merkezler["latitude"], mode="markers",
     marker=dict(size=13, color="rgb(192,57,43)", symbol="circle"),
     name="İlçe Merkezleri",
@@ -85,7 +91,7 @@ if "mesafe_sonuc" in st.session_state and not st.session_state["mesafe_sonuc"].e
             continue
         s = saha_row.iloc[0]
         mk = merkez_lookup.loc[r["ilce_merkezi_id"]]
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(ScatterClass(
             lon=[s["longitude"], mk["longitude"]], lat=[s["latitude"], mk["latitude"]],
             mode="lines", line=dict(width=1, color="rgba(100,100,100,0.4)"),
             showlegend=False, hoverinfo="skip",
@@ -96,8 +102,11 @@ if not df_f.empty:
 else:
     center_lat, center_lon = 40.9, 36.3
 
+map_config = dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=7)
+layout_args = {"mapbox": map_config} if IS_MAPBOX else {"map": map_config}
+
 fig.update_layout(
-    mapbox=dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=7),
+    **layout_args,
     margin=dict(l=0, r=0, t=0, b=0), height=550,
     legend=dict(orientation="h", yanchor="bottom", y=1.02),
 )
@@ -123,10 +132,10 @@ if "mesafe_sonuc" in st.session_state and not st.session_state["mesafe_sonuc"].e
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             tablo_show.to_excel(writer, index=False, sheet_name="Mesafe Listesi")
         st.download_button("⬇️ Excel İndir", data=buf.getvalue(), file_name="saha_mesafe_listesi.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with dl2:
         img = report_utils.tablo_jpg(tablo_show, title="Saha - İlçe Merkezi Mesafe Listesi",
-                                      columns=["Saha Adı", "Merkez", "Mesafe (km)", "Süre (dk)"])
+                                     columns=["Saha Adı", "Merkez", "Mesafe (km)", "Süre (dk)"])
         st.download_button("⬇️ JPG İndir", data=report_utils.image_to_bytes(img), file_name="saha_mesafe_listesi.jpg", mime="image/jpeg")
 else:
     basit_liste = df_f[["placemark_adi", "il", "ilce"]].sort_values("placemark_adi").rename(
