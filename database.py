@@ -1,17 +1,12 @@
 """
 database.py
 -----------
-Tüm SQLite veritabanı işlemleri burada toplanmıştır: şema oluşturma,
-sahalar, ilçe merkezleri, kesinti kayıtları, arıza kayıtları ve
-OSRM mesafe/süre cache tablosu.
-
-Tek bir SQLite dosyası kullanılır: data/yedas_app.db
+Tüm SQLite veritabanı işlemleri burada toplanmıştır.
+Hızlı offline konum tespiti ve performans optimizasyonlu Excel aktarımı içerir.
 """
 
 import sqlite3
 import os
-import json
-import urllib.request
 import pandas as pd
 from datetime import datetime
 from contextlib import contextmanager
@@ -35,7 +30,7 @@ def get_conn():
 
 
 def init_db():
-    """Uygulama ilk açıldığında tüm tabloları oluşturur (varsa dokunmaz)."""
+    """Uygulama ilk açıldığında tüm tabloları oluşturur."""
     with get_conn() as conn:
         c = conn.cursor()
 
@@ -140,12 +135,11 @@ def init_db():
 
         conn.commit()
 
-# Modül yüklendiğinde veritabanı tablolarının varlığını garantiye al
 init_db()
 
 
 def reset_database():
-    """Tüm demo ve mevcut verileri temizleyerek sıfır veritabanı oluşturur."""
+    """Tüm verileri temizler."""
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM kesinti_saha_eslesme;")
@@ -160,34 +154,13 @@ def reset_database():
 
 
 # ---------------------------------------------------------------------------
-# YARDIMCI: KOORDİNAT -> İL / İLÇE TESPİTİ (SADECE EXCEL YÜKLERKEN ÇALIŞIR)
+# HIZLI VE ÇEVRİMDIŞI KOORDİNAT -> İL / İLÇE TESPİTİ
 # ---------------------------------------------------------------------------
 
-def reverse_geocode(lat: float, lon: float):
+def fast_offline_geocode(lat: float, lon: float):
     """
-    Excel'de İl/İlçe sütunu olmadığında koordinattan otomatik il ve ilçe bulur.
-    Yalnızca Excel aktarımı sırasında 1 kez çağrılır ve DB'ye kaydedilir.
+    İnternet / API çağrısı yapmadan saliseler içinde koordinat aralığından il/ilçe belirler.
     """
-    # 1. OpenStreetMap (Nominatim) API Çözümleme
-    try:
-        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=10&accept-language=tr"
-        req = urllib.request.Request(url, headers={'User-Agent': 'yedas_gsm_tracker_app'})
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            data = json.loads(resp.read().decode())
-            if "address" in data:
-                addr = data["address"]
-                il = addr.get("province") or addr.get("state") or addr.get("admin_level_4")
-                ilce = addr.get("town") or addr.get("district") or addr.get("county") or addr.get("suburb") or addr.get("city_district")
-                
-                il_str = str(il).strip() if il else None
-                ilce_str = str(ilce).strip() if ilce else None
-                
-                if il_str:
-                    return il_str, ilce_str
-    except Exception as e:
-        print(f"API Reverse Geocode atlandı ({lat}, {lon}): {e}")
-
-    # 2. Bölgesel Bounding Box Çevrimdışı Koruması (Ağ kısıtı veya API zaman aşımı durumu için)
     if 40.8 <= lat <= 41.7 and 35.2 <= lon <= 37.2:
         return "Samsun", "Merkez"
     elif 40.5 <= lat <= 41.2 and 36.8 <= lon <= 38.2:
@@ -200,7 +173,7 @@ def reverse_geocode(lat: float, lon: float):
         return "Tokat", "Merkez"
     elif 40.0 <= lat <= 41.3 and 34.0 <= lon <= 35.6:
         return "Çorum", "Merkez"
-
+    
     return "Samsun", "Merkez"
 
 
@@ -234,8 +207,7 @@ def get_saha_by_name(name: str):
 
 def upsert_sahalar_from_df(df: pd.DataFrame):
     """
-    Excel'den okunan DataFrame'i sahalar tablosuna ekler / günceller.
-    Excel'de İl/İlçe olmasa dahi koordinat üzerinden otomatik İl/İlçe atar ve DB'ye yazar.
+    Excel'den okunan verileri toplu (bulk) olarak saliseler içinde DB'ye yazar.
     """
     if df is None or df.empty:
         return
@@ -269,16 +241,22 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
     df_clean = df_clean.rename(columns=col_map)
 
     if "placemark_adi" not in df_clean.columns or "latitude" not in df_clean.columns or "longitude" not in df_clean.columns:
-        print("⚠️ Excel'de Saha Adı, Latitude veya Longitude sütunları bulunamadı.")
+        print("⚠️ Excel'de gerekli sütunlar (Placemark Adı, Latitude, Longitude) bulunamadı.")
         return
 
-    # Sayısal veri ve virgül-nokta dönüşümü
     df_clean["latitude"] = pd.to_numeric(df_clean["latitude"].astype(str).str.replace(",", "."), errors="coerce")
     df_clean["longitude"] = pd.to_numeric(df_clean["longitude"].astype(str).str.replace(",", "."), errors="coerce")
     df_clean = df_clean.dropna(subset=["placemark_adi", "latitude", "longitude"])
 
     with get_conn() as conn:
         c = conn.cursor()
+        
+        # Mevcut veritabanı isimlerini hafızaya al
+        existing_rows = {row["placemark_adi"]: row for row in c.execute("SELECT id, placemark_adi, il, ilce FROM sahalar").fetchall()}
+
+        records_to_insert = []
+        records_to_update = []
+
         for _, row in df_clean.iterrows():
             name = str(row.get("placemark_adi", "")).strip()
             if not name:
@@ -295,33 +273,36 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
             il_val = str(row.get("il")).strip() if pd.notna(row.get("il")) and str(row.get("il")).strip() != "" else None
             ilce_val = str(row.get("ilce")).strip() if pd.notna(row.get("ilce")) and str(row.get("ilce")).strip() != "" else None
 
-            # Veritabanındaki mevcut durumu kontrol et
-            existing = c.execute(
-                "SELECT id, il, ilce FROM sahalar WHERE placemark_adi = ?", (name,)
-            ).fetchone()
-
-            # Eğer Excel'de il/ilçe yoksa ve DB'de önceden kayıtlı değilse, koordinattan otomatik tespit et
+            # İl/İlçe yoksa hızlı offline algoritmayla anında belirle
             if not il_val or not ilce_val:
-                if existing and existing["il"] and existing["ilce"]:
-                    il_val = il_val or existing["il"]
-                    ilce_val = ilce_val or existing["ilce"]
+                if name in existing_rows and existing_rows[name]["il"]:
+                    il_val = il_val or existing_rows[name]["il"]
+                    ilce_val = ilce_val or existing_rows[name]["ilce"]
                 else:
-                    geo_il, geo_ilce = reverse_geocode(lat, lon)
+                    geo_il, geo_ilce = fast_offline_geocode(lat, lon)
                     il_val = il_val or geo_il
                     ilce_val = ilce_val or geo_ilce
 
-            if existing:
-                c.execute("""
-                    UPDATE sahalar SET latitude=?, longitude=?, kml_dosyasi=?, aciklama=?,
-                        altitude=?, koordinat_ham=?, il=?, ilce=?, aktif=1, updated_at=datetime('now')
-                    WHERE placemark_adi=?
-                """, (lat, lon, kml, aciklama, alt, koord_ham, il_val, ilce_val, name))
+            if name in existing_rows:
+                records_to_update.append((lat, lon, kml, aciklama, alt, koord_ham, il_val, ilce_val, name))
             else:
-                c.execute("""
-                    INSERT INTO sahalar
-                        (placemark_adi, latitude, longitude, kml_dosyasi, aciklama, altitude, koordinat_ham, il, ilce, aktif)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                """, (name, lat, lon, kml, aciklama, alt, koord_ham, il_val, ilce_val))
+                records_to_insert.append((name, lat, lon, kml, aciklama, alt, koord_ham, il_val, ilce_val))
+
+        # Toplu SQL işlemi (Milisaniyeler sürer)
+        if records_to_update:
+            c.executemany("""
+                UPDATE sahalar SET latitude=?, longitude=?, kml_dosyasi=?, aciklama=?,
+                    altitude=?, koordinat_ham=?, il=?, ilce=?, aktif=1, updated_at=datetime('now')
+                WHERE placemark_adi=?
+            """, records_to_update)
+
+        if records_to_insert:
+            c.executemany("""
+                INSERT INTO sahalar
+                    (placemark_adi, latitude, longitude, kml_dosyasi, aciklama, altitude, koordinat_ham, il, ilce, aktif)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, records_to_insert)
+
         conn.commit()
 
 
