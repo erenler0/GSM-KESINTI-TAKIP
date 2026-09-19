@@ -138,6 +138,9 @@ def init_db():
 
         conn.commit()
 
+# Modül yüklendiğinde veritabanı tablolarının varlığını garantiye al
+init_db()
+
 
 def reset_database():
     """Tüm demo ve mevcut verileri temizleyerek sıfır veritabanı oluşturur."""
@@ -150,7 +153,7 @@ def reset_database():
         c.execute("DELETE FROM sahalar;")
         c.execute("DELETE FROM ilce_merkezleri;")
         c.execute("DELETE FROM excel_sync_log;")
-        c.execute("DELETE FROM sqlite_sequence;") # Auto increment ID'leri sıfırla
+        c.execute("DELETE FROM sqlite_sequence;")
         conn.commit()
 
 
@@ -159,36 +162,39 @@ def reset_database():
 # ---------------------------------------------------------------------------
 
 def get_all_sahalar(only_active=True) -> pd.DataFrame:
-    with get_conn() as conn:
-        q = "SELECT * FROM sahalar"
-        if only_active:
-            q += " WHERE aktif = 1"
-        return pd.read_sql_query(q, conn)
+    try:
+        with get_conn() as conn:
+            q = "SELECT * FROM sahalar"
+            if only_active:
+                q += " WHERE aktif = 1"
+            return pd.read_sql_query(q, conn)
+    except Exception as e:
+        print(f"get_all_sahalar hatası: {e}")
+        return pd.DataFrame()
 
 
 def get_saha_by_name(name: str):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM sahalar WHERE placemark_adi = ?", (name,)
-        ).fetchone()
-        return dict(row) if row else None
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM sahalar WHERE placemark_adi = ?", (name,)
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        print(f"get_saha_by_name hatası: {e}")
+        return None
 
 
 def upsert_sahalar_from_df(df: pd.DataFrame):
-    """
-    Excel'den okunan DataFrame'i sahalar tablosuna ekler / günceller.
-    Gelişmiş kolon eşleme, il/ilçe aktarımı ve boş/geçersiz koordinat koruması içerir.
-    """
-    if df.empty:
+    if df is None or df.empty:
         return
 
     df_clean = df.copy()
 
-    # Kolon isimlerini eşleştirmeyi kolaylaştırmak için harita
     col_map = {}
     for col in df_clean.columns:
         c_lower = str(col).strip().lower().replace("_", "").replace(" ", "")
-        if c_lower in ["placemarkadi", "placemark", "sahaadi", "siteid", "sitename"]:
+        if c_lower in ["placemarkadi", "placemark", "sahaadi", "siteid", "sitename", "saha_adi"]:
             col_map[col] = "placemark_adi"
         elif c_lower in ["latitude", "enlem", "lat"]:
             col_map[col] = "latitude"
@@ -209,15 +215,11 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
 
     df_clean = df_clean.rename(columns=col_map)
 
-    # Zorunlu kolonlar yoksa boş işlem yap
     if "placemark_adi" not in df_clean.columns or "latitude" not in df_clean.columns or "longitude" not in df_clean.columns:
         return
 
-    # Sayısal veri dönüşümü
     df_clean["latitude"] = pd.to_numeric(df_clean["latitude"], errors="coerce")
     df_clean["longitude"] = pd.to_numeric(df_clean["longitude"], errors="coerce")
-
-    # 🛑 BOŞ / GEÇERSİZ KOORDİNAT FİLTRESİ
     df_clean = df_clean.dropna(subset=["placemark_adi", "latitude", "longitude"])
 
     with get_conn() as conn:
@@ -257,12 +259,9 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
 
 
 def diff_and_sync_sahalar(df_new: pd.DataFrame):
-    """
-    Excel Diff senkronizasyonu:
-    - Yeni listede olup DB'de olmayan sahalar eklenir (aktif=1)
-    - DB'de olup yeni listede olmayan sahalar 'pasif' işaretlenir
-    """
-    # Sütun ismi tespiti
+    if df_new is None or df_new.empty:
+        return [], []
+
     name_col = None
     for c in df_new.columns:
         if str(c).strip().lower().replace("_", "").replace(" ", "") in ["placemarkadi", "placemark", "sahaadi", "siteid"]:
@@ -282,10 +281,8 @@ def diff_and_sync_sahalar(df_new: pd.DataFrame):
         eklenen = sorted(new_names - existing_names)
         silinen = sorted(existing_names - new_names)
 
-        # Ekle / güncelle
         upsert_sahalar_from_df(df_new)
 
-        # Silinenleri pasif yap
         for name in silinen:
             c.execute("UPDATE sahalar SET aktif = 0, updated_at=datetime('now') WHERE placemark_adi = ?", (name,))
         conn.commit()
@@ -295,21 +292,27 @@ def diff_and_sync_sahalar(df_new: pd.DataFrame):
 
 
 def log_excel_sync(eklenen, silinen, dosya_adi="upload.xlsx"):
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO excel_sync_log (dosya_adi, eklenen_sayisi, silinen_sayisi, eklenen_isimler, silinen_isimler)
-            VALUES (?, ?, ?, ?, ?)
-        """, (dosya_adi, len(eklenen), len(silinen), ", ".join(eklenen), ", ".join(silinen)))
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.execute("""
+                INSERT INTO excel_sync_log (dosya_adi, eklenen_sayisi, silinen_sayisi, eklenen_isimler, silinen_isimler)
+                VALUES (?, ?, ?, ?, ?)
+            """, (dosya_adi, len(eklenen), len(silinen), ", ".join(eklenen), ", ".join(silinen)))
+            conn.commit()
+    except Exception as e:
+        print(f"log_excel_sync hatası: {e}")
 
 
 def set_saha_ilce_merkezi(saha_id: int, ilce_merkezi_id: int, manuel: bool = True):
-    with get_conn() as conn:
-        conn.execute("""
-            UPDATE sahalar SET ilce_merkezi_id = ?, manuel_atama = ?, updated_at = datetime('now')
-            WHERE id = ?
-        """, (ilce_merkezi_id, 1 if manuel else 0, saha_id))
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.execute("""
+                UPDATE sahalar SET ilce_merkezi_id = ?, manuel_atama = ?, updated_at = datetime('now')
+                WHERE id = ?
+            """, (ilce_merkezi_id, 1 if manuel else 0, saha_id))
+            conn.commit()
+    except Exception as e:
+        print(f"set_saha_ilce_merkezi hatası: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -317,22 +320,32 @@ def set_saha_ilce_merkezi(saha_id: int, ilce_merkezi_id: int, manuel: bool = Tru
 # ---------------------------------------------------------------------------
 
 def get_all_ilce_merkezleri() -> pd.DataFrame:
-    with get_conn() as conn:
-        return pd.read_sql_query("SELECT * FROM ilce_merkezleri ORDER BY il, isim", conn)
+    try:
+        with get_conn() as conn:
+            return pd.read_sql_query("SELECT * FROM ilce_merkezleri ORDER BY il, isim", conn)
+    except Exception as e:
+        print(f"get_all_ilce_merkezleri hatası: {e}")
+        return pd.DataFrame()
 
 
 def add_ilce_merkezi(isim, il, lat, lon):
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO ilce_merkezleri (isim, il, latitude, longitude) VALUES (?, ?, ?, ?)
-        """, (isim, il, lat, lon))
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO ilce_merkezleri (isim, il, latitude, longitude) VALUES (?, ?, ?, ?)
+            """, (isim, il, lat, lon))
+            conn.commit()
+    except Exception as e:
+        print(f"add_ilce_merkezi hatası: {e}")
 
 
 def delete_ilce_merkezi(ilce_id):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM ilce_merkezleri WHERE id = ?", (ilce_id,))
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM ilce_merkezleri WHERE id = ?", (ilce_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"delete_ilce_merkezi hatası: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -340,23 +353,30 @@ def delete_ilce_merkezi(ilce_id):
 # ---------------------------------------------------------------------------
 
 def get_osrm_cache(saha_id, ilce_merkezi_id):
-    with get_conn() as conn:
-        row = conn.execute("""
-            SELECT * FROM osrm_cache WHERE saha_id = ? AND ilce_merkezi_id = ?
-        """, (saha_id, ilce_merkezi_id)).fetchone()
-        return dict(row) if row else None
+    try:
+        with get_conn() as conn:
+            row = conn.execute("""
+                SELECT * FROM osrm_cache WHERE saha_id = ? AND ilce_merkezi_id = ?
+            """, (saha_id, ilce_merkezi_id)).fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        print(f"get_osrm_cache hatası: {e}")
+        return None
 
 
 def set_osrm_cache(saha_id, ilce_merkezi_id, mesafe_km, sure_dk, route_geojson=None):
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO osrm_cache (saha_id, ilce_merkezi_id, mesafe_km, sure_dk, route_geojson, updated_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(saha_id, ilce_merkezi_id) DO UPDATE SET
-                mesafe_km=excluded.mesafe_km, sure_dk=excluded.sure_dk,
-                route_geojson=excluded.route_geojson, updated_at=datetime('now')
-        """, (saha_id, ilce_merkezi_id, mesafe_km, sure_dk, route_geojson))
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.execute("""
+                INSERT INTO osrm_cache (saha_id, ilce_merkezi_id, mesafe_km, sure_dk, route_geojson, updated_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(saha_id, ilce_merkezi_id) DO UPDATE SET
+                    mesafe_km=excluded.mesafe_km, sure_dk=excluded.sure_dk,
+                    route_geojson=excluded.route_geojson, updated_at=datetime('now')
+            """, (saha_id, ilce_merkezi_id, mesafe_km, sure_dk, route_geojson))
+            conn.commit()
+    except Exception as e:
+        print(f"set_osrm_cache hatası: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -364,78 +384,107 @@ def set_osrm_cache(saha_id, ilce_merkezi_id, mesafe_km, sure_dk, route_geojson=N
 # ---------------------------------------------------------------------------
 
 def insert_kesinti(yedas_ref, il, ilce, baslangic, bitis, is_aciklamasi, polygon_wkt, kaynak="YEDAS_API"):
-    with get_conn() as conn:
-        cur = conn.execute("""
-            INSERT INTO kesintiler (yedas_ref, il, ilce, baslangic, bitis, is_aciklamasi, polygon_wkt, kaynak)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (yedas_ref, il, ilce, baslangic, bitis, is_aciklamasi, polygon_wkt, kaynak))
-        conn.commit()
-        return cur.lastrowid
+    try:
+        with get_conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO kesintiler (yedas_ref, il, ilce, baslangic, bitis, is_aciklamasi, polygon_wkt, kaynak)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (yedas_ref, il, ilce, baslangic, bitis, is_aciklamasi, polygon_wkt, kaynak))
+            conn.commit()
+            return cur.lastrowid
+    except Exception as e:
+        print(f"insert_kesinti hatası: {e}")
+        return None
 
 
 def link_kesinti_saha(kesinti_id, saha_id):
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO kesinti_saha_eslesme (kesinti_id, saha_id) VALUES (?, ?)
-        """, (kesinti_id, saha_id))
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO kesinti_saha_eslesme (kesinti_id, saha_id) VALUES (?, ?)
+            """, (kesinti_id, saha_id))
+            conn.commit()
+    except Exception as e:
+        print(f"link_kesinti_saha hatası: {e}")
 
 
-def get_kesintiler(gun_sayisi=1) -> pd.DataFrame:
-    with get_conn() as conn:
-        return pd.read_sql_query(f"""
-            SELECT * FROM kesintiler
-            WHERE date(baslangic) >= date('now', '-{int(gun_sayisi)} days')
-               OR date(bitis) >= date('now')
-            ORDER BY baslangic DESC
-        """, conn)
+def get_kesintiler(gun_sayisi=30) -> pd.DataFrame:
+    try:
+        with get_conn() as conn:
+            # Tüm kesintileri çek, tarih süzgecini SQL çökmesini engellemek için esnek tut
+            q = f"""
+                SELECT * FROM kesintiler
+                WHERE baslangic >= datetime('now', '-{int(gun_sayisi)} days')
+                   OR bitis >= datetime('now', '-1 days')
+                   OR baslangic IS NULL
+                ORDER BY id DESC
+            """
+            df = pd.read_sql_query(q, conn)
+            if df.empty:
+                # Esnek sorgu: Filtresiz tüm kesintileri çekmeyi dene
+                df = pd.read_sql_query("SELECT * FROM kesintiler ORDER BY id DESC", conn)
+            return df
+    except Exception as e:
+        print(f"get_kesintiler hatası: {e}")
+        return pd.DataFrame()
 
 
 def get_etkilenen_sahalar(kesinti_id) -> pd.DataFrame:
-    with get_conn() as conn:
-        return pd.read_sql_query("""
-            SELECT s.* FROM sahalar s
-            JOIN kesinti_saha_eslesme k ON k.saha_id = s.id
-            WHERE k.kesinti_id = ?
-        """, conn, params=(kesinti_id,))
+    try:
+        with get_conn() as conn:
+            return pd.read_sql_query("""
+                SELECT s.* FROM sahalar s
+                JOIN kesinti_saha_eslesme k ON k.saha_id = s.id
+                WHERE k.kesinti_id = ?
+            """, conn, params=(kesinti_id,))
+    except Exception as e:
+        print(f"get_etkilenen_sahalar hatası: {e}")
+        return pd.DataFrame()
 
 
 def get_kesinti_history_for_saha(saha_adi, start_date=None, end_date=None) -> pd.DataFrame:
-    q = """
-        SELECT k.* FROM kesintiler k
-        JOIN kesinti_saha_eslesme e ON e.kesinti_id = k.id
-        JOIN sahalar s ON s.id = e.saha_id
-        WHERE s.placemark_adi = ?
-    """
-    params = [saha_adi]
-    if start_date:
-        q += " AND date(k.baslangic) >= date(?)"
-        params.append(start_date)
-    if end_date:
-        q += " AND date(k.baslangic) <= date(?)"
-        params.append(end_date)
-    with get_conn() as conn:
-        return pd.read_sql_query(q, conn, params=params)
+    try:
+        q = """
+            SELECT k.* FROM kesintiler k
+            JOIN kesinti_saha_eslesme e ON e.kesinti_id = k.id
+            JOIN sahalar s ON s.id = e.saha_id
+            WHERE s.placemark_adi = ?
+        """
+        params = [saha_adi]
+        if start_date:
+            q += " AND k.baslangic >= ?"
+            params.append(str(start_date))
+        if end_date:
+            q += " AND k.baslangic <= ?"
+            params.append(str(end_date))
+        with get_conn() as conn:
+            return pd.read_sql_query(q, conn, params=params)
+    except Exception as e:
+        print(f"get_kesinti_history_for_saha hatası: {e}")
+        return pd.DataFrame()
 
 
 def get_top_n_stats(n=5, start_date=None, end_date=None):
-    """Top-N Saha / İl / İlçe kesinti sayıları."""
-    q = "SELECT k.*, s.placemark_adi FROM kesintiler k LEFT JOIN kesinti_saha_eslesme e ON e.kesinti_id = k.id LEFT JOIN sahalar s ON s.id = e.saha_id WHERE 1=1"
-    params = []
-    if start_date:
-        q += " AND date(k.baslangic) >= date(?)"
-        params.append(start_date)
-    if end_date:
-        q += " AND date(k.baslangic) <= date(?)"
-        params.append(end_date)
-    with get_conn() as conn:
-        df = pd.read_sql_query(q, conn, params=params)
-    if df.empty:
+    try:
+        q = "SELECT k.*, s.placemark_adi FROM kesintiler k LEFT JOIN kesinti_saha_eslesme e ON e.kesinti_id = k.id LEFT JOIN sahalar s ON s.id = e.saha_id WHERE 1=1"
+        params = []
+        if start_date:
+            q += " AND k.baslangic >= ?"
+            params.append(str(start_date))
+        if end_date:
+            q += " AND k.baslangic <= ?"
+            params.append(str(end_date))
+        with get_conn() as conn:
+            df = pd.read_sql_query(q, conn, params=params)
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        top_saha = df.dropna(subset=["placemark_adi"]).groupby("placemark_adi").size().reset_index(name="kesinti_sayisi").sort_values("kesinti_sayisi", ascending=False).head(n)
+        top_il = df.dropna(subset=["il"]).groupby("il").size().reset_index(name="kesinti_sayisi").sort_values("kesinti_sayisi", ascending=False).head(n)
+        top_ilce = df.dropna(subset=["ilce"]).groupby("ilce").size().reset_index(name="kesinti_sayisi").sort_values("kesinti_sayisi", ascending=False).head(n)
+        return top_saha, top_il, top_ilce
+    except Exception as e:
+        print(f"get_top_n_stats hatası: {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    top_saha = df.dropna(subset=["placemark_adi"]).groupby("placemark_adi").size().reset_index(name="kesinti_sayisi").sort_values("kesinti_sayisi", ascending=False).head(n)
-    top_il = df.groupby("il").size().reset_index(name="kesinti_sayisi").sort_values("kesinti_sayisi", ascending=False).head(n)
-    top_ilce = df.groupby("ilce").size().reset_index(name="kesinti_sayisi").sort_values("kesinti_sayisi", ascending=False).head(n)
-    return top_saha, top_il, top_ilce
 
 
 # ---------------------------------------------------------------------------
@@ -443,34 +492,41 @@ def get_top_n_stats(n=5, start_date=None, end_date=None):
 # ---------------------------------------------------------------------------
 
 def insert_ariza_kaydi(saha_id, mains_saati, kesinti_saati, enerji_gelis_saati, backup_suresi_dk, kesinti_suresi_dk, yorum):
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO ariza_kayitlari
-                (saha_id, mains_saati, kesinti_saati, enerji_gelis_saati, backup_suresi_dk, kesinti_suresi_dk, yorum)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (saha_id, mains_saati, kesinti_saati, enerji_gelis_saati, backup_suresi_dk, kesinti_suresi_dk, yorum))
-        conn.commit()
+    try:
+        with get_conn() as conn:
+            conn.execute("""
+                INSERT INTO ariza_kayitlari
+                    (saha_id, mains_saati, kesinti_saati, enerji_gelis_saati, backup_suresi_dk, kesinti_suresi_dk, yorum)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (saha_id, mains_saati, kesinti_saati, enerji_gelis_saati, backup_suresi_dk, kesinti_suresi_dk, yorum))
+            conn.commit()
+    except Exception as e:
+        print(f"insert_ariza_kaydi hatası: {e}")
 
 
 def get_ariza_kayitlari(saha_adi=None, start_date=None, end_date=None) -> pd.DataFrame:
-    q = """
-        SELECT a.*, s.placemark_adi, s.il, s.ilce FROM ariza_kayitlari a
-        JOIN sahalar s ON s.id = a.saha_id
-        WHERE 1=1
-    """
-    params = []
-    if saha_adi:
-        q += " AND s.placemark_adi = ?"
-        params.append(saha_adi)
-    if start_date:
-        q += " AND date(a.mains_saati) >= date(?)"
-        params.append(start_date)
-    if end_date:
-        q += " AND date(a.mains_saati) <= date(?)"
-        params.append(end_date)
-    q += " ORDER BY a.mains_saati DESC"
-    with get_conn() as conn:
-        return pd.read_sql_query(q, conn, params=params)
+    try:
+        q = """
+            SELECT a.*, s.placemark_adi, s.il, s.ilce FROM ariza_kayitlari a
+            JOIN sahalar s ON s.id = a.saha_id
+            WHERE 1=1
+        """
+        params = []
+        if saha_adi:
+            q += " AND s.placemark_adi = ?"
+            params.append(saha_adi)
+        if start_date:
+            q += " AND a.mains_saati >= ?"
+            params.append(str(start_date))
+        if end_date:
+            q += " AND a.mains_saati <= ?"
+            params.append(str(end_date))
+        q += " ORDER BY a.mains_saati DESC"
+        with get_conn() as conn:
+            return pd.read_sql_query(q, conn, params=params)
+    except Exception as e:
+        print(f"get_ariza_kayitlari hatası: {e}")
+        return pd.DataFrame()
 
 
 def get_ariza_ozet_metrikleri(saha_adi=None, start_date=None, end_date=None):
@@ -478,8 +534,8 @@ def get_ariza_ozet_metrikleri(saha_adi=None, start_date=None, end_date=None):
     if df.empty:
         return {"ortalama_backup_dk": 0, "ortalama_kesinti_dk": 0, "toplam_kesinti_saat": 0, "kayit_sayisi": 0}
     return {
-        "ortalama_backup_dk": round(df["backup_suresi_dk"].mean(), 1),
-        "ortalama_kesinti_dk": round(df["kesinti_suresi_dk"].mean(), 1),
-        "toplam_kesinti_saat": round(df["kesinti_suresi_dk"].sum() / 60, 1),
+        "ortalama_backup_dk": round(df["backup_suresi_dk"].mean(), 1) if "backup_suresi_dk" in df else 0,
+        "ortalama_kesinti_dk": round(df["kesinti_suresi_dk"].mean(), 1) if "kesinti_suresi_dk" in df else 0,
+        "toplam_kesinti_saat": round(df["kesinti_suresi_dk"].sum() / 60, 1) if "kesinti_suresi_dk" in df else 0,
         "kayit_sayisi": len(df),
     }
