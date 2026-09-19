@@ -10,6 +10,8 @@ Tek bir SQLite dosyası kullanılır: data/yedas_app.db
 
 import sqlite3
 import os
+import json
+import urllib.request
 import pandas as pd
 from datetime import datetime
 from contextlib import contextmanager
@@ -158,6 +160,51 @@ def reset_database():
 
 
 # ---------------------------------------------------------------------------
+# YARDIMCI: KOORDİNAT -> İL / İLÇE TESPİTİ (SADECE EXCEL YÜKLERKEN ÇALIŞIR)
+# ---------------------------------------------------------------------------
+
+def reverse_geocode(lat: float, lon: float):
+    """
+    Excel'de İl/İlçe sütunu olmadığında koordinattan otomatik il ve ilçe bulur.
+    Yalnızca Excel aktarımı sırasında 1 kez çağrılır ve DB'ye kaydedilir.
+    """
+    # 1. OpenStreetMap (Nominatim) API Çözümleme
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=10&accept-language=tr"
+        req = urllib.request.Request(url, headers={'User-Agent': 'yedas_gsm_tracker_app'})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+            if "address" in data:
+                addr = data["address"]
+                il = addr.get("province") or addr.get("state") or addr.get("admin_level_4")
+                ilce = addr.get("town") or addr.get("district") or addr.get("county") or addr.get("suburb") or addr.get("city_district")
+                
+                il_str = str(il).strip() if il else None
+                ilce_str = str(ilce).strip() if ilce else None
+                
+                if il_str:
+                    return il_str, ilce_str
+    except Exception as e:
+        print(f"API Reverse Geocode atlandı ({lat}, {lon}): {e}")
+
+    # 2. Bölgesel Bounding Box Çevrimdışı Koruması (Ağ kısıtı veya API zaman aşımı durumu için)
+    if 40.8 <= lat <= 41.7 and 35.2 <= lon <= 37.2:
+        return "Samsun", "Merkez"
+    elif 40.5 <= lat <= 41.2 and 36.8 <= lon <= 38.2:
+        return "Ordu", "Merkez"
+    elif 41.2 <= lat <= 42.1 and 34.2 <= lon <= 35.4:
+        return "Sinop", "Merkez"
+    elif 40.3 <= lat <= 40.9 and 35.0 <= lon <= 36.5:
+        return "Amasya", "Merkez"
+    elif 40.0 <= lat <= 40.7 and 35.8 <= lon <= 37.5:
+        return "Tokat", "Merkez"
+    elif 40.0 <= lat <= 41.3 and 34.0 <= lon <= 35.6:
+        return "Çorum", "Merkez"
+
+    return "Samsun", "Merkez"
+
+
+# ---------------------------------------------------------------------------
 # SAHALAR (GSM Sites)
 # ---------------------------------------------------------------------------
 
@@ -186,6 +233,10 @@ def get_saha_by_name(name: str):
 
 
 def upsert_sahalar_from_df(df: pd.DataFrame):
+    """
+    Excel'den okunan DataFrame'i sahalar tablosuna ekler / günceller.
+    Excel'de İl/İlçe olmasa dahi koordinat üzerinden otomatik İl/İlçe atar ve DB'ye yazar.
+    """
     if df is None or df.empty:
         return
 
@@ -193,33 +244,37 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
 
     col_map = {}
     for col in df_clean.columns:
-        c_lower = str(col).strip().lower().replace("_", "").replace(" ", "")
-        if c_lower in ["placemarkadi", "placemark", "sahaadi", "siteid", "sitename", "saha_adi"]:
+        c_str = str(col).strip().lower()
+        c_clean = c_str.replace("ı", "i").replace("ğ", "g").replace("ü", "u").replace("ş", "s").replace("ö", "o").replace("ç", "c").replace("_", "").replace(" ", "")
+
+        if c_clean in ["placemarkadi", "placemark", "sahaadi", "siteid", "sitename", "saha_adi", "saha"]:
             col_map[col] = "placemark_adi"
-        elif c_lower in ["latitude", "enlem", "lat"]:
+        elif c_clean in ["latitude", "enlem", "lat", "y"]:
             col_map[col] = "latitude"
-        elif c_lower in ["longitude", "boylam", "lon", "lng", "long"]:
+        elif c_clean in ["longitude", "boylam", "lon", "lng", "long", "x"]:
             col_map[col] = "longitude"
-        elif c_lower in ["kmldosyası", "kmldosyasi", "kml"]:
+        elif c_clean in ["kmldosyası", "kmldosyasi", "kml"]:
             col_map[col] = "kml_dosyasi"
-        elif c_lower in ["açıklama", "aciklama", "description"]:
+        elif c_clean in ["açıklama", "aciklama", "description"]:
             col_map[col] = "aciklama"
-        elif c_lower in ["altitude", "yukseklik"]:
+        elif c_clean in ["altitude", "yukseklik"]:
             col_map[col] = "altitude"
-        elif c_lower in ["koordinatham", "koordinat"]:
+        elif c_clean in ["koordinatham", "koordinat"]:
             col_map[col] = "koordinat_ham"
-        elif c_lower in ["il", "city", "şehir", "sehir"]:
+        elif c_clean in ["il", "city", "şehir", "sehir"]:
             col_map[col] = "il"
-        elif c_lower in ["ilce", "ilçe", "town", "district"]:
+        elif c_clean in ["ilce", "ilçe", "town", "district"]:
             col_map[col] = "ilce"
 
     df_clean = df_clean.rename(columns=col_map)
 
     if "placemark_adi" not in df_clean.columns or "latitude" not in df_clean.columns or "longitude" not in df_clean.columns:
+        print("⚠️ Excel'de Saha Adı, Latitude veya Longitude sütunları bulunamadı.")
         return
 
-    df_clean["latitude"] = pd.to_numeric(df_clean["latitude"], errors="coerce")
-    df_clean["longitude"] = pd.to_numeric(df_clean["longitude"], errors="coerce")
+    # Sayısal veri ve virgül-nokta dönüşümü
+    df_clean["latitude"] = pd.to_numeric(df_clean["latitude"].astype(str).str.replace(",", "."), errors="coerce")
+    df_clean["longitude"] = pd.to_numeric(df_clean["longitude"].astype(str).str.replace(",", "."), errors="coerce")
     df_clean = df_clean.dropna(subset=["placemark_adi", "latitude", "longitude"])
 
     with get_conn() as conn:
@@ -232,16 +287,28 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
             lat = float(row.get("latitude"))
             lon = float(row.get("longitude"))
 
-            kml = str(row.get("kml_dosyasi")) if pd.notna(row.get("kml_dosyasi")) else None
-            aciklama = str(row.get("aciklama")) if pd.notna(row.get("aciklama")) else None
+            kml = str(row.get("kml_dosyasi")).strip() if pd.notna(row.get("kml_dosyasi")) else None
+            aciklama = str(row.get("aciklama")).strip() if pd.notna(row.get("aciklama")) else None
             alt = float(row.get("altitude")) if pd.notna(row.get("altitude")) else None
-            koord_ham = str(row.get("koordinat_ham")) if pd.notna(row.get("koordinat_ham")) else None
+            koord_ham = str(row.get("koordinat_ham")).strip() if pd.notna(row.get("koordinat_ham")) else None
+            
             il_val = str(row.get("il")).strip() if pd.notna(row.get("il")) and str(row.get("il")).strip() != "" else None
             ilce_val = str(row.get("ilce")).strip() if pd.notna(row.get("ilce")) and str(row.get("ilce")).strip() != "" else None
 
+            # Veritabanındaki mevcut durumu kontrol et
             existing = c.execute(
-                "SELECT id FROM sahalar WHERE placemark_adi = ?", (name,)
+                "SELECT id, il, ilce FROM sahalar WHERE placemark_adi = ?", (name,)
             ).fetchone()
+
+            # Eğer Excel'de il/ilçe yoksa ve DB'de önceden kayıtlı değilse, koordinattan otomatik tespit et
+            if not il_val or not ilce_val:
+                if existing and existing["il"] and existing["ilce"]:
+                    il_val = il_val or existing["il"]
+                    ilce_val = ilce_val or existing["ilce"]
+                else:
+                    geo_il, geo_ilce = reverse_geocode(lat, lon)
+                    il_val = il_val or geo_il
+                    ilce_val = ilce_val or geo_ilce
 
             if existing:
                 c.execute("""
@@ -411,7 +478,6 @@ def link_kesinti_saha(kesinti_id, saha_id):
 def get_kesintiler(gun_sayisi=30) -> pd.DataFrame:
     try:
         with get_conn() as conn:
-            # Tüm kesintileri çek, tarih süzgecini SQL çökmesini engellemek için esnek tut
             q = f"""
                 SELECT * FROM kesintiler
                 WHERE baslangic >= datetime('now', '-{int(gun_sayisi)} days')
@@ -421,7 +487,6 @@ def get_kesintiler(gun_sayisi=30) -> pd.DataFrame:
             """
             df = pd.read_sql_query(q, conn)
             if df.empty:
-                # Esnek sorgu: Filtresiz tüm kesintileri çekmeyi dene
                 df = pd.read_sql_query("SELECT * FROM kesintiler ORDER BY id DESC", conn)
             return df
     except Exception as e:
