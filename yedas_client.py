@@ -29,7 +29,7 @@ REQUEST_TIMEOUT = 15
 # Gerçek API'ye ulaşılamayan (sandbox / offline) ortamlarda otomatik
 # olarak örnek veriye düşer. Canlı sunucuda bunu False yapın ya da
 # .streamlit/secrets.toml içine YEDAS_USE_MOCK=false ekleyin.
-USE_MOCK_DATA_DEFAULT = True
+USE_MOCK_DATA_DEFAULT = False
 
 # Olası JSON alan adı varyasyonlarını tek bir iç şemaya eşlemek için.
 FIELD_MAP_CANDIDATES = {
