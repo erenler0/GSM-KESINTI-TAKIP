@@ -14,19 +14,21 @@ st.set_page_config(page_title="Ana Ekran", page_icon="📡", layout="wide")
 st.title("📡 YEDAŞ Canlı Kesintiler & Anlık Takip")
 
 # ---------------------------------------------------------------------------
-# Filtreler
+# Filtreler & Test Modu
 # ---------------------------------------------------------------------------
-c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1.5, 1.5])
 with c1:
-    daily = st.button("📅 Daily (Günlük)", use_container_width=True)
+    daily = st.button("📅 Günlük", use_container_width=True)
 with c2:
     three_day = st.button("📅 3 Günlük", use_container_width=True)
 with c3:
     seven_day = st.button("📅 7 Günlük", use_container_width=True)
 with c4:
-    if st.button("🔄 Şimdi Yenile (Cache Temizle)"):
+    if st.button("🔄 Cache Temizle"):
         yedas_client.fetch_yedas_outages.clear()
         st.rerun()
+with c5:
+    test_mode = st.toggle("🧪 Test Poligonu Üret", value=False)
 
 if "gun_filtresi" not in st.session_state:
     st.session_state.gun_filtresi = 1
@@ -38,20 +40,37 @@ if seven_day:
     st.session_state.gun_filtresi = 7
 
 gun = st.session_state.gun_filtresi
-st.caption(f"Görüntülenen aralık: **{gun} gün** | Veri 5 dakikada bir otomatik güncellenir (`st.cache_data ttl=300`)")
+st.caption(f"Görüntülenen aralık: **{gun} gün** | Veri 5 dakikada bir otomatik güncellenir.")
 
 # ---------------------------------------------------------------------------
-# Veri çekme + spatial join
+# Veri çekme + Test Modu Entegrasyonu
 # ---------------------------------------------------------------------------
 with st.spinner("YEDAŞ kesinti verisi çekiliyor..."):
     df_outages_raw = yedas_client.fetch_yedas_outages(use_mock=yedas_client.USE_MOCK_DATA_DEFAULT)
 
-# Tarih filtresi boş dönerse ham veriyi göstererek güvenli fallback sağla
 df_outages = yedas_client.filter_by_range(df_outages_raw, gun)
 if df_outages.empty and not df_outages_raw.empty:
     df_outages = df_outages_raw
 
 df_sahalar = db.get_all_sahalar()
+if df_outages.empty or test_mode:
+    if not df_sahalar.empty:
+        mean_lat = df_sahalar["latitude"].mean()
+        mean_lon = df_sahalar["longitude"].mean()
+        
+        sample_wkt = f"POLYGON (({mean_lon - 0.1} {mean_lat - 0.1}, {mean_lon + 0.1} {mean_lat - 0.1}, {mean_lon + 0.1} {mean_lat + 0.1}, {mean_lon - 0.1} {mean_lat + 0.1}, {mean_lon - 0.1} {mean_lat - 0.1}))"
+        
+        mock_row = pd.DataFrame([{
+            "yedas_ref": "TEST-REF-999",
+            "il": "Samsun",
+            "ilce": "İlkadım",
+            "baslangic": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "bitis": (pd.Timestamp.now() + pd.Timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S"),
+            "aciklama": "Test Amaçlı Simülasyon Kesinti Poligonu",
+            "polygon_wkt": sample_wkt
+        }])
+        df_outages = pd.concat([df_outages, mock_row], ignore_index=True)
+        st.info("🧪 **Test Modu Aktif:** Sahalarınızı test etmek için ekrana örnek bir kesinti poligonu yerleştirildi.")
 
 if df_outages.empty:
     st.success("✅ Seçilen aralıkta planlı kesinti bulunmuyor.")
@@ -68,7 +87,7 @@ m2.metric("📡 Etkilenen Saha", etkilenen_sayisi)
 m3.metric("🕐 Toplam Saha", len(df_sahalar))
 
 # ---------------------------------------------------------------------------
-# Harita
+# Harita (Plotly v7+ Uyumlu Scattermap)
 # ---------------------------------------------------------------------------
 st.subheader("🗺️ Harita — Turuncu: Kesinti Alanları | Mavi: GSM Sahaları")
 
@@ -83,7 +102,7 @@ for _, row in df_outages.iterrows():
             continue
         poly = shapely_wkt.loads(str(wkt_val))
         xs, ys = poly.exterior.xy
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lon=list(xs), lat=list(ys), mode="lines", fill="toself",
             fillcolor="rgba(230,126,34,0.35)", line=dict(color="rgb(230,126,34)", width=2),
             name=f"{row.get('il', '')}/{row.get('ilce', '')}",
@@ -95,7 +114,7 @@ for _, row in df_outages.iterrows():
 
 # Tüm sahalar (açık mavi, küçük)
 if not df_sahalar.empty:
-    fig.add_trace(go.Scattermapbox(
+    fig.add_trace(go.Scattermap(
         lon=df_sahalar["longitude"], lat=df_sahalar["latitude"], mode="markers",
         marker=dict(size=5, color="rgba(52,152,219,0.35)"),
         name="Tüm Sahalar", hovertext=df_sahalar["placemark_adi"], hoverinfo="text",
@@ -103,7 +122,7 @@ if not df_sahalar.empty:
 
 # Etkilenen sahalar (koyu mavi, büyük)
 if not matched.empty and "longitude" in matched.columns:
-    fig.add_trace(go.Scattermapbox(
+    fig.add_trace(go.Scattermap(
         lon=matched["longitude"], lat=matched["latitude"], mode="markers",
         marker=dict(size=11, color="rgb(21,67,96)"),
         name="Etkilenen Sahalar",
@@ -114,11 +133,11 @@ if not matched.empty and "longitude" in matched.columns:
 center_lat = df_sahalar["latitude"].mean() if not df_sahalar.empty else 41.28
 center_lon = df_sahalar["longitude"].mean() if not df_sahalar.empty else 36.33
 fig.update_layout(
-    mapbox=dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=7),
+    map=dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=7),
     margin=dict(l=0, r=0, t=0, b=0), height=550,
     legend=dict(orientation="h", yanchor="bottom", y=1.02),
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch')
 
 # ---------------------------------------------------------------------------
 # Liste & Detay
@@ -126,7 +145,6 @@ st.plotly_chart(fig, use_container_width=True)
 st.subheader("📋 Kesinti Listesi ve Etkilenen Sahalar")
 
 for idx, outage in df_outages.reset_index(drop=True).iterrows():
-    # Eşleşen saha listesini güvenli şekilde filtrele (kesinti sütun prefix uyumu gözetildi)
     saha_list = []
     if not matched.empty:
         ref_val = outage.get("yedas_ref") or outage.get("ref")
@@ -144,7 +162,7 @@ for idx, outage in df_outages.reset_index(drop=True).iterrows():
             st.write(f"**Referans:** {outage.get('yedas_ref', outage.get('ref', '-'))}")
             if saha_list:
                 st.write("**Etkilenen Sahalar:**")
-                st.dataframe(pd.DataFrame({"Saha Adı": saha_list}), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame({"Saha Adı": saha_list}), width='stretch', hide_index=True)
             else:
                 st.caption("Bu kesinti alanında GSM sahası bulunmuyor.")
         with cc2:
