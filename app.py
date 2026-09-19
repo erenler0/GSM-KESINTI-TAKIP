@@ -12,7 +12,6 @@ multipage yapısıyla sol menüde listelenir.
 
 import streamlit as st
 import database as db
-import pandas as pd
 
 st.set_page_config(
     page_title="YEDAŞ Kesinti & GSM Saha İzleme",
@@ -57,5 +56,3 @@ with col3:
 with col4:
     admin_status = "🟢 Aktif" if st.session_state.get("is_admin") else "🔴 Pasif"
     st.metric("🔐 Admin Oturumu", admin_status)
-
-# Mavi st.info() not kutusu buradan kaldırılmıştır.
