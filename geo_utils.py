@@ -20,7 +20,8 @@ from shapely.geometry import Point
 
 def sahalar_to_geodataframe(df_sahalar: pd.DataFrame) -> gpd.GeoDataFrame:
     """Sahalar DataFrame'ini (latitude/longitude) GeoDataFrame'e çevirir."""
-    geometry = [Point(xy) for xy in zip(df_sahalar["longitude"], df_sahalar["latitude"])]
+    # 🛑 DİKKAT: Shapely için sıra Point(longitude, latitude) olmalıdır!
+    geometry = [Point(float(xy[0]), float(xy[1])) for xy in zip(df_sahalar["longitude"], df_sahalar["latitude"])]
     gdf = gpd.GeoDataFrame(df_sahalar.copy(), geometry=geometry, crs="EPSG:4326")
     return gdf
 
@@ -37,12 +38,16 @@ def kesintiler_to_geodataframe(df_kesinti: pd.DataFrame) -> gpd.GeoDataFrame:
         if not w or pd.isna(w):
             continue
         try:
-            geoms.append(shapely_wkt.loads(w))
-            valid_idx.append(idx)
-        except Exception:
+            poly = shapely_wkt.loads(str(w))
+            if poly.is_valid and not poly.is_empty:
+                geoms.append(poly)
+                valid_idx.append(idx)
+        except Exception as e:
+            print(f"WKT Okuma Hatası (Index {idx}): {e}")
             continue
     if not geoms:
         return gpd.GeoDataFrame(columns=list(df_kesinti.columns) + ["geometry"], geometry="geometry", crs="EPSG:4326")
+    
     sub = df_kesinti.loc[valid_idx].copy()
     return gpd.GeoDataFrame(sub, geometry=geoms, crs="EPSG:4326")
 
@@ -51,23 +56,32 @@ def match_sahalar_with_outages(df_sahalar: pd.DataFrame, df_kesinti: pd.DataFram
     """
     Point-in-Polygon + R-Tree spatial join:
     Her kesinti poligonunun içinde kalan sahaları bulur.
-
-    Dönüş: sahalar sütunları + kesinti sütunları (prefix: kesinti_) birleşik DataFrame.
-    Eşleşme yoksa boş DataFrame döner.
     """
-    if df_sahalar.empty or df_kesinti.empty:
+    if df_sahalar is None or df_sahalar.empty or df_kesinti is None or df_kesinti.empty:
         return pd.DataFrame()
 
     gdf_sahalar = sahalar_to_geodataframe(df_sahalar)
     gdf_kesinti = kesintiler_to_geodataframe(df_kesinti)
 
     if gdf_kesinti.empty:
+        print("⚠️ Eşleştirme başarısız: Geçerli kesinti poligonu bulunamadı.")
         return pd.DataFrame()
 
-    # predicate="within": saha noktası poligonun içinde mi? (R-Tree index ile hızlandırılmış)
+    # Koordinat sistemlerinin eşleştiğinden emin ol (WGS 84)
+    if gdf_sahalar.crs != gdf_kesinti.crs:
+        gdf_kesinti = gdf_kesinti.to_crs(gdf_sahalar.crs)
+
+    # 🛑 İSTEĞE BAĞLI TOLERANS: CRS metre tabanlı olmadığı için derece cinsinden çok küçük bir buffer (0.00001 derece ~ 1 metre) 
+    # sınırda kalan sahaların kaçmasını engeller. İstemiyorsanız .buffer(0) bırakabilirsiniz.
+    gdf_kesinti["geometry"] = gdf_kesinti["geometry"].apply(lambda geom: geom.buffer(0.00001))
+
+    # predicate="within": saha noktası poligonun içinde mi?
     joined = gpd.sjoin(gdf_sahalar, gdf_kesinti, how="inner", predicate="within")
 
-    # index_right -> kesinti tablosundaki orijinal index; kesinti sütunlarını prefix'le
+    if joined.empty:
+        print(f"ℹ️ Bilgi: {len(gdf_sahalar)} saha ile {len(gdf_kesinti)} kesinti poligonu örtüşmedi (Hiçbir saha kesinti alanında değil).")
+        return pd.DataFrame()
+
     kesinti_cols = [c for c in df_kesinti.columns if c != "geometry"]
     rename_map = {c: f"kesinti_{c}" for c in kesinti_cols if c in joined.columns}
     joined = joined.rename(columns=rename_map)
@@ -77,12 +91,10 @@ def match_sahalar_with_outages(df_sahalar: pd.DataFrame, df_kesinti: pd.DataFram
 
 def find_nearest_ilce_merkezi(saha_lat, saha_lon, df_merkezler: pd.DataFrame):
     """
-    Haversine mesafesine göre (kuş uçuşu, ön-seçim amaçlı) en yakın
-    ilçe merkezini bulur. Gerçek yol mesafesi için osrm_client kullanılır;
-    bu fonksiyon sadece "varsayılan atama" için hızlı bir ön belirleme yapar.
+    Haversine mesafesine göre en yakın ilçe merkezini bulur.
     """
     if df_merkezler.empty:
-        return None
+        return None, float("inf")
 
     from math import radians, sin, cos, sqrt, atan2
 
