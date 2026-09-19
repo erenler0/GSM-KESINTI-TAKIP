@@ -177,7 +177,7 @@ def get_saha_by_name(name: str):
 def upsert_sahalar_from_df(df: pd.DataFrame):
     """
     Excel'den okunan DataFrame'i sahalar tablosuna ekler / günceller.
-    Gelişmiş kolon eşleme ve boş/geçersiz koordinat koruması içerir.
+    Gelişmiş kolon eşleme, il/ilçe aktarımı ve boş/geçersiz koordinat koruması içerir.
     """
     if df.empty:
         return
@@ -202,6 +202,10 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
             col_map[col] = "altitude"
         elif c_lower in ["koordinatham", "koordinat"]:
             col_map[col] = "koordinat_ham"
+        elif c_lower in ["il", "city", "şehir", "sehir"]:
+            col_map[col] = "il"
+        elif c_lower in ["ilce", "ilçe", "town", "district"]:
+            col_map[col] = "ilce"
 
     df_clean = df_clean.rename(columns=col_map)
 
@@ -213,7 +217,7 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
     df_clean["latitude"] = pd.to_numeric(df_clean["latitude"], errors="coerce")
     df_clean["longitude"] = pd.to_numeric(df_clean["longitude"], errors="coerce")
 
-    # 🛑 BOŞ / GEÇERSİZ KOORDİNAT FİLTRESİ (NOT NULL Constraint Hatalarını Engeller)
+    # 🛑 BOŞ / GEÇERSİZ KOORDİNAT FİLTRESİ
     df_clean = df_clean.dropna(subset=["placemark_adi", "latitude", "longitude"])
 
     with get_conn() as conn:
@@ -230,6 +234,8 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
             aciklama = str(row.get("aciklama")) if pd.notna(row.get("aciklama")) else None
             alt = float(row.get("altitude")) if pd.notna(row.get("altitude")) else None
             koord_ham = str(row.get("koordinat_ham")) if pd.notna(row.get("koordinat_ham")) else None
+            il_val = str(row.get("il")).strip() if pd.notna(row.get("il")) and str(row.get("il")).strip() != "" else None
+            ilce_val = str(row.get("ilce")).strip() if pd.notna(row.get("ilce")) and str(row.get("ilce")).strip() != "" else None
 
             existing = c.execute(
                 "SELECT id FROM sahalar WHERE placemark_adi = ?", (name,)
@@ -238,15 +244,15 @@ def upsert_sahalar_from_df(df: pd.DataFrame):
             if existing:
                 c.execute("""
                     UPDATE sahalar SET latitude=?, longitude=?, kml_dosyasi=?, aciklama=?,
-                        altitude=?, koordinat_ham=?, aktif=1, updated_at=datetime('now')
+                        altitude=?, koordinat_ham=?, il=?, ilce=?, aktif=1, updated_at=datetime('now')
                     WHERE placemark_adi=?
-                """, (lat, lon, kml, aciklama, alt, koord_ham, name))
+                """, (lat, lon, kml, aciklama, alt, koord_ham, il_val, ilce_val, name))
             else:
                 c.execute("""
                     INSERT INTO sahalar
-                        (placemark_adi, latitude, longitude, kml_dosyasi, aciklama, altitude, koordinat_ham, aktif)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                """, (name, lat, lon, kml, aciklama, alt, koord_ham))
+                        (placemark_adi, latitude, longitude, kml_dosyasi, aciklama, altitude, koordinat_ham, il, ilce, aktif)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """, (name, lat, lon, kml, aciklama, alt, koord_ham, il_val, ilce_val))
         conn.commit()
 
 
