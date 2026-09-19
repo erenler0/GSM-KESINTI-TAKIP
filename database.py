@@ -139,6 +139,21 @@ def init_db():
         conn.commit()
 
 
+def reset_database():
+    """Tüm demo ve mevcut verileri temizleyerek sıfır veritabanı oluşturur."""
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM kesinti_saha_eslesme;")
+        c.execute("DELETE FROM ariza_kayitlari;")
+        c.execute("DELETE FROM osrm_cache;")
+        c.execute("DELETE FROM kesintiler;")
+        c.execute("DELETE FROM sahalar;")
+        c.execute("DELETE FROM ilce_merkezleri;")
+        c.execute("DELETE FROM excel_sync_log;")
+        c.execute("DELETE FROM sqlite_sequence;") # Auto increment ID'leri sıfırla
+        conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # SAHALAR (GSM Sites)
 # ---------------------------------------------------------------------------
@@ -162,38 +177,76 @@ def get_saha_by_name(name: str):
 def upsert_sahalar_from_df(df: pd.DataFrame):
     """
     Excel'den okunan DataFrame'i sahalar tablosuna ekler / günceller.
-    Beklenen sütunlar: Placemark Adı, Latitude, Longitude, KML Dosyası,
-    Açıklama, Altitude, Koordinat (Ham)
+    Gelişmiş kolon eşleme ve boş/geçersiz koordinat koruması içerir.
     """
+    if df.empty:
+        return
+
+    df_clean = df.copy()
+
+    # Kolon isimlerini eşleştirmeyi kolaylaştırmak için harita
+    col_map = {}
+    for col in df_clean.columns:
+        c_lower = str(col).strip().lower().replace("_", "").replace(" ", "")
+        if c_lower in ["placemarkadi", "placemark", "sahaadi", "siteid", "sitename"]:
+            col_map[col] = "placemark_adi"
+        elif c_lower in ["latitude", "enlem", "lat"]:
+            col_map[col] = "latitude"
+        elif c_lower in ["longitude", "boylam", "lon", "lng", "long"]:
+            col_map[col] = "longitude"
+        elif c_lower in ["kmldosyası", "kmldosyasi", "kml"]:
+            col_map[col] = "kml_dosyasi"
+        elif c_lower in ["açıklama", "aciklama", "description"]:
+            col_map[col] = "aciklama"
+        elif c_lower in ["altitude", "yukseklik"]:
+            col_map[col] = "altitude"
+        elif c_lower in ["koordinatham", "koordinat"]:
+            col_map[col] = "koordinat_ham"
+
+    df_clean = df_clean.rename(columns=col_map)
+
+    # Zorunlu kolonlar yoksa boş işlem yap
+    if "placemark_adi" not in df_clean.columns or "latitude" not in df_clean.columns or "longitude" not in df_clean.columns:
+        return
+
+    # Sayısal veri dönüşümü
+    df_clean["latitude"] = pd.to_numeric(df_clean["latitude"], errors="coerce")
+    df_clean["longitude"] = pd.to_numeric(df_clean["longitude"], errors="coerce")
+
+    # 🛑 BOŞ / GEÇERSİZ KOORDİNAT FİLTRESİ (NOT NULL Constraint Hatalarını Engeller)
+    df_clean = df_clean.dropna(subset=["placemark_adi", "latitude", "longitude"])
+
     with get_conn() as conn:
         c = conn.cursor()
-        for _, row in df.iterrows():
-            name = str(row.get("Placemark Adı", "")).strip()
+        for _, row in df_clean.iterrows():
+            name = str(row.get("placemark_adi", "")).strip()
             if not name:
                 continue
+
+            lat = float(row.get("latitude"))
+            lon = float(row.get("longitude"))
+
+            kml = str(row.get("kml_dosyasi")) if pd.notna(row.get("kml_dosyasi")) else None
+            aciklama = str(row.get("aciklama")) if pd.notna(row.get("aciklama")) else None
+            alt = float(row.get("altitude")) if pd.notna(row.get("altitude")) else None
+            koord_ham = str(row.get("koordinat_ham")) if pd.notna(row.get("koordinat_ham")) else None
+
             existing = c.execute(
                 "SELECT id FROM sahalar WHERE placemark_adi = ?", (name,)
             ).fetchone()
-            vals = (
-                float(row.get("Latitude")) if pd.notna(row.get("Latitude")) else None,
-                float(row.get("Longitude")) if pd.notna(row.get("Longitude")) else None,
-                str(row.get("KML Dosyası", "")) if pd.notna(row.get("KML Dosyası", None)) else None,
-                str(row.get("Açıklama", "")) if pd.notna(row.get("Açıklama", None)) else None,
-                float(row.get("Altitude")) if pd.notna(row.get("Altitude", None)) else None,
-                str(row.get("Koordinat (Ham)", "")) if pd.notna(row.get("Koordinat (Ham)", None)) else None,
-            )
+
             if existing:
                 c.execute("""
                     UPDATE sahalar SET latitude=?, longitude=?, kml_dosyasi=?, aciklama=?,
                         altitude=?, koordinat_ham=?, aktif=1, updated_at=datetime('now')
                     WHERE placemark_adi=?
-                """, (*vals, name))
+                """, (lat, lon, kml, aciklama, alt, koord_ham, name))
             else:
                 c.execute("""
                     INSERT INTO sahalar
                         (placemark_adi, latitude, longitude, kml_dosyasi, aciklama, altitude, koordinat_ham, aktif)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                """, (name, *vals))
+                """, (name, lat, lon, kml, aciklama, alt, koord_ham))
         conn.commit()
 
 
@@ -201,10 +254,20 @@ def diff_and_sync_sahalar(df_new: pd.DataFrame):
     """
     Excel Diff senkronizasyonu:
     - Yeni listede olup DB'de olmayan sahalar eklenir (aktif=1)
-    - DB'de olup yeni listede olmayan sahalar 'pasif' işaretlenir (silinmiş sayılır)
-    Dönüş: (eklenen_isimler: list, silinen_isimler: list)
+    - DB'de olup yeni listede olmayan sahalar 'pasif' işaretlenir
     """
-    new_names = set(df_new["Placemark Adı"].astype(str).str.strip())
+    # Sütun ismi tespiti
+    name_col = None
+    for c in df_new.columns:
+        if str(c).strip().lower().replace("_", "").replace(" ", "") in ["placemarkadi", "placemark", "sahaadi", "siteid"]:
+            name_col = c
+            break
+
+    if not name_col:
+        name_col = df_new.columns[0]
+
+    new_names = set(df_new[name_col].astype(str).str.strip())
+
     with get_conn() as conn:
         c = conn.cursor()
         existing_rows = c.execute("SELECT placemark_adi FROM sahalar WHERE aktif = 1").fetchall()
@@ -213,10 +276,10 @@ def diff_and_sync_sahalar(df_new: pd.DataFrame):
         eklenen = sorted(new_names - existing_names)
         silinen = sorted(existing_names - new_names)
 
-        # Ekle / güncelle (yeni olanlar dahil hepsini upsert et)
-        upsert_sahalar_from_df(df_new[df_new["Placemark Adı"].astype(str).str.strip().isin(new_names)])
+        # Ekle / güncelle
+        upsert_sahalar_from_df(df_new)
 
-        # Silinenleri pasif yap (gerçek silme yapmıyoruz, veri kaybını önlemek için)
+        # Silinenleri pasif yap
         for name in silinen:
             c.execute("UPDATE sahalar SET aktif = 0, updated_at=datetime('now') WHERE placemark_adi = ?", (name,))
         conn.commit()
