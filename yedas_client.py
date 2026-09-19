@@ -1,7 +1,7 @@
 """
 yedas_client.py
 ----------------
-YEDAŞ planlı kesinti API'sinden ve GeoJSON servislerinden canlı veri çeker.
+YEDAŞ planlı kesinti API'sinden canlı veri çeker ve mahalle/adres detaylarını işler.
 """
 
 import requests
@@ -23,7 +23,7 @@ FIELD_MAP_CANDIDATES = {
     "ilce": ["ilce", "district", "town", "DISTRICT_NAME", "ilceAdi"],
     "baslangic": ["baslangicTarihi", "start_date", "kesinti_baslangic", "startDate", "BAS_TARIH"],
     "bitis": ["bitisTarihi", "end_date", "kesinti_bitis", "endDate", "BIT_TARIH"],
-    "aciklama": ["isAciklamasi", "description", "aciklama", "workDescription", "ACIKLAMA"],
+    "aciklama": ["isAciklamasi", "description", "aciklama", "workDescription", "ACIKLAMA", "adres", "Mahalle"],
     "ref": ["id", "referansNo", "ref", "kesintiId", "OBJECTID"],
 }
 
@@ -38,7 +38,7 @@ def _first_match(d: dict, keys: list, default=None):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_yedas_outages(use_mock: bool = USE_MOCK_DATA_DEFAULT) -> pd.DataFrame:
     """
-    YEDAŞ planlı kesinti verisini ve harita katmanlarını çeker.
+    YEDAŞ planlı kesinti verisini ve adres/mahalle detaylarını çeker.
     """
     if use_mock:
         try:
@@ -52,7 +52,7 @@ def fetch_yedas_outages(use_mock: bool = USE_MOCK_DATA_DEFAULT) -> pd.DataFrame:
     rows = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # 1. Ana Kesinti Harita Verisini Çek
+    # 1. Ana Kesinti Harita/Veri Servisini Çek
     try:
         resp = requests.get(YEDAS_API_URL, timeout=REQUEST_TIMEOUT, headers=headers)
         resp.raise_for_status()
@@ -61,7 +61,7 @@ def fetch_yedas_outages(use_mock: bool = USE_MOCK_DATA_DEFAULT) -> pd.DataFrame:
     except Exception as e:
         print(f"YEDAŞ planli-kesinti-harita çekilemedi: {e}")
 
-    # 2. Eğer ana endpoint yetersiz kalırsa veya boş dönerse provinces/districts katmanlarını da tara
+    # 2. Alternatif katmanları tara
     if not rows:
         try:
             resp_prov = requests.get(PROVINCES_URL, timeout=REQUEST_TIMEOUT, headers=headers)
@@ -72,7 +72,6 @@ def fetch_yedas_outages(use_mock: bool = USE_MOCK_DATA_DEFAULT) -> pd.DataFrame:
 
     df_result = pd.DataFrame(rows)
 
-    # Hiç veri alınamazsa sistemin çökmemesi için mock veriye güvenli fallback yap
     if df_result.empty:
         try:
             from sample_data import generate_mock_outages
@@ -105,13 +104,16 @@ def _parse_features(payload) -> list:
             except Exception:
                 wkt = None
 
+        # Adres veya açıklama metnini en geniş şekilde yakala
+        aciklama_metni = _first_match(props, FIELD_MAP_CANDIDATES["aciklama"])
+        
         rows.append({
             "yedas_ref": _first_match(props, FIELD_MAP_CANDIDATES["ref"]),
             "il": _first_match(props, FIELD_MAP_CANDIDATES["il"]),
             "ilce": _first_match(props, FIELD_MAP_CANDIDATES["ilce"]),
             "baslangic": _first_match(props, FIELD_MAP_CANDIDATES["baslangic"]),
-            "bitis": _first_match(props, FIELD_MAP_CANDIDATES["bitis"]),
-            "aciklama": _first_match(props, FIELD_MAP_CANDIDATES["aciklama"]),
+            "bitis": _first_match(props, FIELD_MAP_CANDIDates["bitis"] if "bitis" in FIELD_MAP_CANDIDATES else "bitisTarihi"),
+            "aciklama": str(aciklama_metni) if aciklama_metni else "",
             "polygon_wkt": wkt,
         })
     return rows
