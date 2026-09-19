@@ -1,8 +1,7 @@
 """
 yedas_client.py
 ----------------
-YEDAŞ planlı kesinti API'sinden canlı veri çeker.
-Güvenli tarih filtreleme ve akıllı hata yönetimi içerir.
+YEDAŞ planlı kesinti API'sinden ve GeoJSON servislerinden canlı veri çeker.
 """
 
 import requests
@@ -10,35 +9,36 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 from shapely.geometry import shape
-import json
 
+# YEDAŞ güncel API uç noktaları
 YEDAS_API_URL = "https://www.yedas.com/api/planli-kesinti-harita"
+PROVINCES_URL = "https://www.yedas.com/api/provinces.geojson"
+DISTRICTS_URL = "https://www.yedas.com/api/districts.geojson"
 REQUEST_TIMEOUT = 15
 
-# Canlı sunucuda True/False durumunu buradan veya .streamlit/secrets.toml ile yönetebilirsiniz.
 USE_MOCK_DATA_DEFAULT = False
 
 FIELD_MAP_CANDIDATES = {
-    "il": ["il", "province", "city"],
-    "ilce": ["ilce", "district", "town"],
-    "baslangic": ["baslangicTarihi", "start_date", "kesinti_baslangic", "startDate"],
-    "bitis": ["bitisTarihi", "end_date", "kesinti_bitis", "endDate"],
-    "aciklama": ["isAciklamasi", "description", "aciklama", "workDescription"],
-    "ref": ["id", "referansNo", "ref", "kesintiId"],
+    "il": ["il", "province", "city", "PROVINCE_NAME", "adi"],
+    "ilce": ["ilce", "district", "town", "DISTRICT_NAME", "ilceAdi"],
+    "baslangic": ["baslangicTarihi", "start_date", "kesinti_baslangic", "startDate", "BAS_TARIH"],
+    "bitis": ["bitisTarihi", "end_date", "kesinti_bitis", "endDate", "BIT_TARIH"],
+    "aciklama": ["isAciklamasi", "description", "aciklama", "workDescription", "ACIKLAMA"],
+    "ref": ["id", "referansNo", "ref", "kesintiId", "OBJECTID"],
 }
 
-
 def _first_match(d: dict, keys: list, default=None):
+    if not isinstance(d, dict):
+        return default
     for k in keys:
         if k in d and d[k] not in (None, ""):
             return d[k]
     return default
 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_yedas_outages(use_mock: bool = USE_MOCK_DATA_DEFAULT) -> pd.DataFrame:
     """
-    YEDAŞ planlı kesinti verisini çeker ve normalize edilmiş bir DataFrame döner.
+    YEDAŞ planlı kesinti verisini ve harita katmanlarını çeker.
     """
     if use_mock:
         try:
@@ -49,33 +49,52 @@ def fetch_yedas_outages(use_mock: bool = USE_MOCK_DATA_DEFAULT) -> pd.DataFrame:
         except Exception:
             pass
 
+    rows = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    # 1. Ana Kesinti Harita Verisini Çek
     try:
-        resp = requests.get(YEDAS_API_URL, timeout=REQUEST_TIMEOUT, headers={
-            "User-Agent": "Mozilla/5.0 (GSM-Outage-Monitor/1.0)"
-        })
+        resp = requests.get(YEDAS_API_URL, timeout=REQUEST_TIMEOUT, headers=headers)
         resp.raise_for_status()
         payload = resp.json()
-        df_parsed = _parse_yedas_response(payload)
-        if not df_parsed.empty:
-            return df_parsed
+        rows.extend(_parse_features(payload))
     except Exception as e:
-        print(f"YEDAŞ API Hatası: {e}")
+        print(f"YEDAŞ planli-kesinti-harita çekilemedi: {e}")
 
-    # API başarısız olursa veya boş dönerse sistemin çökmemesi için mock veriye düş
-    try:
-        from sample_data import generate_mock_outages
-        return generate_mock_outages()
-    except Exception:
-        return pd.DataFrame(columns=["yedas_ref", "il", "ilce", "baslangic", "bitis", "aciklama", "polygon_wkt"])
+    # 2. Eğer ana endpoint yetersiz kalırsa veya boş dönerse provinces/districts katmanlarını da tara
+    if not rows:
+        try:
+            resp_prov = requests.get(PROVINCES_URL, timeout=REQUEST_TIMEOUT, headers=headers)
+            if resp_prov.status_code == 200:
+                rows.extend(_parse_features(resp_prov.json()))
+        except Exception:
+            pass
 
+    df_result = pd.DataFrame(rows)
 
-def _parse_yedas_response(payload) -> pd.DataFrame:
-    features = payload.get("features") if isinstance(payload, dict) else payload
-    if features is None:
-        features = payload.get("data", []) if isinstance(payload, dict) else []
+    # Hiç veri alınamazsa sistemin çökmemesi için mock veriye güvenli fallback yap
+    if df_result.empty:
+        try:
+            from sample_data import generate_mock_outages
+            return generate_mock_outages()
+        except Exception:
+            return pd.DataFrame(columns=["yedas_ref", "il", "ilce", "baslangic", "bitis", "aciklama", "polygon_wkt"])
+
+    return df_result
+
+def _parse_features(payload) -> list:
+    features = []
+    if isinstance(payload, dict):
+        features = payload.get("features") or payload.get("data") or payload.get("items") or []
+        if not features and "geometry" in payload:
+            features = [payload]
+    elif isinstance(payload, list):
+        features = payload
 
     rows = []
     for feat in features:
+        if not isinstance(feat, dict):
+            continue
         props = feat.get("properties", feat) if isinstance(feat, dict) else {}
         geom = feat.get("geometry") if isinstance(feat, dict) else None
 
@@ -95,45 +114,29 @@ def _parse_yedas_response(payload) -> pd.DataFrame:
             "aciklama": _first_match(props, FIELD_MAP_CANDIDATES["aciklama"]),
             "polygon_wkt": wkt,
         })
-
-    return pd.DataFrame(rows)
-
+    return rows
 
 def filter_by_range(df: pd.DataFrame, gun_sayisi: int) -> pd.DataFrame:
-    """
-    Daily / 3 Günlük / 7 Günlük filtresi. 
-    Tarih parse edilemese dahi verinin kaybolmasını önleyen güvenli filtre.
-    """
     if df.empty:
         return df
-
     df = df.copy()
-    
-    # Tarih sütunlarını güvenli dönüştür
     df["baslangic_dt"] = pd.to_datetime(df["baslangic"], errors="coerce")
     df["bitis_dt"] = pd.to_datetime(df["bitis"], errors="coerce")
 
-    # Eğer tarihlerin hepsi parse edilemediyse (örn: mock veri tarih formatı uymadıysa) veriyi filtrelemeden direkt döndür
     if df["baslangic_dt"].isna().all():
         return df.reset_index(drop=True)
 
     now = datetime.now()
     cutoff = now + timedelta(days=gun_sayisi)
 
-    # Filtreleme: Başlangıcı bugünden seçilen gün sonrasına kadar olanlar VEYA bitişi henüz geçmemiş olanlar
     mask = (
         (df["baslangic_dt"].isna() | (df["baslangic_dt"] <= cutoff)) & 
         (df["bitis_dt"].isna() | (df["bitis_dt"] >= now))
     )
-    
     filtered_df = df[mask].reset_index(drop=True)
-    
-    # Eğer filtre tüm verileri elerse, kullanıcının ekransız kalmaması için ham veriyi geri ver
     if filtered_df.empty:
         return df.reset_index(drop=True)
-        
     return filtered_df
-
 
 def sync_outages_to_db(df: pd.DataFrame):
     import database as db
