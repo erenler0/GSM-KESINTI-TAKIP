@@ -87,7 +87,7 @@ m2.metric("📡 Etkilenen Saha", etkilenen_sayisi)
 m3.metric("🕐 Toplam Saha", len(df_sahalar))
 
 # ---------------------------------------------------------------------------
-# Harita (Plotly v7+ Uyumlu Scattermap)
+# Harita
 # ---------------------------------------------------------------------------
 st.subheader("🗺️ Harita — Turuncu: Kesinti Alanları | Mavi: GSM Sahaları")
 
@@ -120,13 +120,18 @@ if not df_sahalar.empty:
         name="Tüm Sahalar", hovertext=df_sahalar["placemark_adi"], hoverinfo="text",
     ))
 
-# Etkilenen sahalar (koyu mavi, büyük)
+# Etkilenen sahalar (koyu mavi, büyük - Güvenli hovertext yapısı)
 if not matched.empty and "longitude" in matched.columns:
+    il_col = matched["kesinti_il"] if "kesinti_il" in matched.columns else (matched["il"] if "il" in matched.columns else pd.Series([""] * len(matched)))
+    ilce_col = matched["kesinti_ilce"] if "kesinti_ilce" in matched.columns else (matched["ilce"] if "ilce" in matched.columns else pd.Series([""] * len(matched)))
+    
+    hover_texts = matched["placemark_adi"].astype(str) + " | " + il_col.astype(str) + "/" + ilce_col.astype(str)
+    
     fig.add_trace(go.Scattermap(
         lon=matched["longitude"], lat=matched["latitude"], mode="markers",
         marker=dict(size=11, color="rgb(21,67,96)"),
         name="Etkilenen Sahalar",
-        hovertext=matched["placemark_adi"] + " | " + matched.get("kesinti_il", matched.get("il", "")).astype(str) + "/" + matched.get("kesinti_ilce", matched.get("ilce", "")).astype(str),
+        hovertext=hover_texts,
         hoverinfo="text",
     ))
 
