@@ -1,102 +1,85 @@
 """
 geo_utils.py
 ------------
-GeoPandas / Shapely tabanlı mekansal (spatial) işlemler:
-  - 1300 GSM sahasının, YEDAŞ kesinti poligonlarının İÇİNDE olup
-    olmadığının R-Tree indeksli spatial join ile milisaniyeler
-    içinde bulunması.
-  - Sahadan en yakın ilçe merkezinin bulunması (nearest-neighbor).
+Metin tabanlı (İl-İlçe-Mahalle) eşleştirme işlemleri ve 
+saha-ilçe merkezi arası koordinat (Haversine) mesafe hesaplamaları.
 
-GeoPandas'ın `sjoin` fonksiyonu, altyapıda Shapely/RTree spatial index
-kullanır; bu sayede 1300 nokta x N poligon karşılaştırması,
-naive O(n*m) döngüye göre çok daha hızlı çalışır.
+Not: YEDAŞ poligonlarının kararsızlığı nedeniyle GeoPandas (sjoin) 
+iptal edilmiş, yerine standartlaştırılmış Pandas metin eşleştirmesi 
+(pd.merge) entegre edilmiştir.
 """
 
-import geopandas as gpd
 import pandas as pd
-from shapely import wkt as shapely_wkt
-from shapely.geometry import Point
+import re
+from math import radians, sin, cos, sqrt, atan2
 
-
-def sahalar_to_geodataframe(df_sahalar: pd.DataFrame) -> gpd.GeoDataFrame:
-    """Sahalar DataFrame'ini (latitude/longitude) GeoDataFrame'e çevirir."""
-    # 🛑 DİKKAT: Shapely için sıra Point(longitude, latitude) olmalıdır!
-    geometry = [Point(float(xy[0]), float(xy[1])) for xy in zip(df_sahalar["longitude"], df_sahalar["latitude"])]
-    gdf = gpd.GeoDataFrame(df_sahalar.copy(), geometry=geometry, crs="EPSG:4326")
-    return gdf
-
-
-def kesintiler_to_geodataframe(df_kesinti: pd.DataFrame) -> gpd.GeoDataFrame:
+def standardize_text(text):
     """
-    Kesinti DataFrame'ini (polygon_wkt sütunu) GeoDataFrame'e çevirir.
-    Geçersiz / boş WKT olan satırlar atlanır.
+    Metinleri eşleştirme için standart hale getirir:
+    - Küçük harfe çevirir ve Türkçe karakterleri tolere eder.
+    - 'mah.', 'mahallesi', 'koy' gibi takıları siler.
+    - Noktalama işaretlerini temizler.
     """
-    geoms = []
-    valid_idx = []
-    for idx, row in df_kesinti.iterrows():
-        w = row.get("polygon_wkt")
-        if not w or pd.isna(w):
-            continue
-        try:
-            poly = shapely_wkt.loads(str(w))
-            if poly.is_valid and not poly.is_empty:
-                geoms.append(poly)
-                valid_idx.append(idx)
-        except Exception as e:
-            print(f"WKT Okuma Hatası (Index {idx}): {e}")
-            continue
-    if not geoms:
-        return gpd.GeoDataFrame(columns=list(df_kesinti.columns) + ["geometry"], geometry="geometry", crs="EPSG:4326")
+    if not isinstance(text, str) or pd.isna(text):
+        return ""
     
-    sub = df_kesinti.loc[valid_idx].copy()
-    return gpd.GeoDataFrame(sub, geometry=geoms, crs="EPSG:4326")
+    text = text.lower()
+    text = text.replace("i̇", "i").replace("ı", "i").replace("ş", "s").replace("ğ", "g").replace("ü", "u").replace("ö", "o").replace("ç", "c")
+    
+    # Mahalle/Köy takılarını temizle
+    text = re.sub(r'\b(mah|mahallesi|mah\.|koy|koyu|koy\.)\b', '', text)
+    
+    # Sadece harfler ve rakamlar kalsın (noktalama işaretlerini boşluğa çevir)
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    
+    # Fazla boşlukları temizle
+    return " ".join(text.split())
 
-
-def match_sahalar_with_outages(df_sahalar: pd.DataFrame, df_kesinti: pd.DataFrame) -> pd.DataFrame:
+def match_sahalar_with_text(df_sahalar: pd.DataFrame, df_kesinti: pd.DataFrame) -> pd.DataFrame:
     """
-    Point-in-Polygon + R-Tree spatial join:
-    Her kesinti poligonunun içinde kalan sahaları bulur.
+    Standartlaştırılmış İl, İlçe ve Mahalle metinlerine göre 
+    sahalar ile kesintileri eşleştirir (Pandas Inner Merge).
     """
     if df_sahalar is None or df_sahalar.empty or df_kesinti is None or df_kesinti.empty:
         return pd.DataFrame()
-
-    gdf_sahalar = sahalar_to_geodataframe(df_sahalar)
-    gdf_kesinti = kesintiler_to_geodataframe(df_kesinti)
-
-    if gdf_kesinti.empty:
-        print("⚠️ Eşleştirme başarısız: Geçerli kesinti poligonu bulunamadı.")
-        return pd.DataFrame()
-
-    # Koordinat sistemlerinin eşleştiğinden emin ol (WGS 84)
-    if gdf_sahalar.crs != gdf_kesinti.crs:
-        gdf_kesinti = gdf_kesinti.to_crs(gdf_sahalar.crs)
-
-    # 🛑 İSTEĞE BAĞLI TOLERANS: CRS metre tabanlı olmadığı için derece cinsinden çok küçük bir buffer (0.00001 derece ~ 1 metre) 
-    # sınırda kalan sahaların kaçmasını engeller. İstemiyorsanız .buffer(0) bırakabilirsiniz.
-    gdf_kesinti["geometry"] = gdf_kesinti["geometry"].apply(lambda geom: geom.buffer(0.00001))
-
-    # predicate="within": saha noktası poligonun içinde mi?
-    joined = gpd.sjoin(gdf_sahalar, gdf_kesinti, how="inner", predicate="within")
-
-    if joined.empty:
-        print(f"ℹ️ Bilgi: {len(gdf_sahalar)} saha ile {len(gdf_kesinti)} kesinti poligonu örtüşmedi (Hiçbir saha kesinti alanında değil).")
-        return pd.DataFrame()
-
-    kesinti_cols = [c for c in df_kesinti.columns if c != "geometry"]
-    rename_map = {c: f"kesinti_{c}" for c in kesinti_cols if c in joined.columns}
-    joined = joined.rename(columns=rename_map)
-
-    return joined.drop(columns=["geometry"], errors="ignore").reset_index(drop=True)
-
+        
+    # Her iki dataframe için arama (match) sütunları oluştur
+    # df_sahalar tarafında 'il', 'ilce', 'mahalle' sütunlarının DB'den gelmesi gerekir
+    df_sahalar_copy = df_sahalar.copy()
+    df_sahalar_copy['match_il'] = df_sahalar_copy.get('il', '').apply(standardize_text)
+    df_sahalar_copy['match_ilce'] = df_sahalar_copy.get('ilce', '').apply(standardize_text)
+    df_sahalar_copy['match_mahalle'] = df_sahalar_copy.get('mahalle', '').apply(standardize_text)
+    
+    df_kesinti_copy = df_kesinti.copy()
+    df_kesinti_copy['match_il'] = df_kesinti_copy.get('il', '').apply(standardize_text)
+    df_kesinti_copy['match_ilce'] = df_kesinti_copy.get('ilce', '').apply(standardize_text)
+    df_kesinti_copy['match_mahalle'] = df_kesinti_copy.get('mahalle', '').apply(standardize_text)
+    
+    # İl, İlçe ve Mahalle üzerinden eşleştir
+    matched = pd.merge(
+        df_sahalar_copy, 
+        df_kesinti_copy, 
+        on=['match_il', 'match_ilce', 'match_mahalle'], 
+        how='inner',
+        suffixes=('', '_kesinti')
+    )
+    
+    # Merge sonrası oluşan mükerrer sütun isimlerini temizle/düzenle
+    for col in matched.columns:
+        if col.endswith('_kesinti'):
+            base_col = col.replace('_kesinti', '')
+            rename_col = f"kesinti_{base_col}"
+            matched.rename(columns={col: rename_col}, inplace=True)
+            
+    return matched.reset_index(drop=True)
 
 def find_nearest_ilce_merkezi(saha_lat, saha_lon, df_merkezler: pd.DataFrame):
     """
-    Haversine mesafesine göre en yakın ilçe merkezini bulur.
+    Kuş uçuşu (Haversine) mesafesine göre en yakın ilçe merkezini bulur.
+    (Ekran 3 - OSRM rotalama öncesi ön eleme için kullanılır)
     """
     if df_merkezler.empty:
         return None, float("inf")
-
-    from math import radians, sin, cos, sqrt, atan2
 
     def haversine(lat1, lon1, lat2, lon2):
         R = 6371.0
